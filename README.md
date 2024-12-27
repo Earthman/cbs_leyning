@@ -10,10 +10,11 @@ A Python script that generates detailed Torah reading schedules using HebCal's L
   - Aliyot verse ranges
   - Hebrew dates
   - Special Shabbatot
-  - Page numbers (optional)
-  - Weekday readings tab
+  - Page numbers in Etz Hayim (optional)
+  - Override HebCal Haftarah verses (optional)
+  - Weekday readings tab for daily minyan
 - Handles special readings (Rosh Chodesh, Fast Days, Chol Ha-moed)
-- Supports custom page number mapping via CSV
+- Supports custom page number mapping and Haftarah verses via CSV
 
 ## Prerequisites
 
@@ -107,3 +108,4 @@ This project uses the HebCal API which has its own terms of service. Please revi
 
 - HebCal for providing the Leyning API
 - Google Sheets API for spreadsheet functionality
+– Claude.ai
