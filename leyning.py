@@ -294,6 +294,18 @@ def _next_day(date_str):
             + timedelta(days=1)).strftime('%Y-%m-%d')
 
 
+def _preceding_monday(date_str):
+    """The Monday strictly before date_str (a parsha Saturday -> 5 days
+    earlier). Used as the --book window start so the Minyan tab picks up
+    both weekday Torah readings (Monday and Thursday) in the week leading
+    up to the first Shabbat."""
+    d = datetime.strptime(date_str, '%Y-%m-%d')
+    days_back = d.weekday()  # Mon=0 .. Sun=6 == days since the last Monday
+    if days_back == 0:
+        days_back = 7  # date itself is Monday -> the previous Monday
+    return (d - timedelta(days=days_back)).strftime('%Y-%m-%d')
+
+
 def find_next_book_reading(book, today_str, verbose=False, max_chunks=6):
     """Page through the HebCal API to find the next complete reading of book.
 
@@ -976,13 +988,17 @@ def main():
                   f"(no following book found in the available data).",
                   file=sys.stderr)
 
-        # Restrict to this book's window so the workbook (including the
-        # weekday Minyan readings) covers exactly this book.
+        # Back the window up to the Monday before the first parsha so the
+        # Minyan tab includes that week's weekday readings; restrict to this
+        # book's window otherwise.
+        window_start = _preceding_monday(start_date)
         data = {'items': [it for it in items_pool
-                          if start_date <= it['date'] <= end_date]}
+                          if window_start <= it['date'] <= end_date]}
 
         print(f"{book}: {start_date} ({parshas[0][1]}) -> "
               f"{end_date} ({parshas[-1][1]}), {len(parshas)} parshas")
+        print(f"  (window starts {window_start}, the Monday before "
+              f"{start_date}, to include the weekday minyan readings)")
         if args.verbose:
             for d, n in parshas:
                 print(f"  {d}  {n}", file=sys.stderr)
