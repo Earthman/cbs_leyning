@@ -67,6 +67,20 @@ their own tabs, as they always have. When `--book` is used and `-s` is
 omitted, the output filename defaults to `<Book>.xlsx` (e.g.
 `Leviticus.xlsx`). `START_DATE`/`END_DATE` are not needed with `--book`.
 
+The generated window does **not** start on the first parsha's Shabbat
+(Saturday). It is backed up to the **Monday before** that Shabbat, so the
+Minyan tab includes the weekday Torah readings (Monday and Thursday) for
+the week leading up to the first Shabbat — these were previously missing.
+The resolved range is printed when you run, e.g.:
+
+```
+Leviticus: 2027-03-20 (Vayikra) -> 2027-05-29 (Bechukotai), 10 parshas
+  (window starts 2027-03-15, the Monday before 2027-03-20, to include the weekday minyan readings)
+```
+
+This only affects the `--book` path; an explicit `START_DATE`/`END_DATE`
+range is used exactly as given.
+
 ### Arguments
 
 - `START_DATE`: Start date in YYYY-MM-DD format (omit when using `--book`)
