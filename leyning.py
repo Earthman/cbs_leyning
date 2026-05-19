@@ -500,8 +500,14 @@ def write_header(ws, parsha_data, scroll_name="Gunther", template_data=None):
 
     scroll_name_str = str(scroll_name) if scroll_name is not None else "Gunther"
     parsha_en = parsha_data['name']['en']
-    vt_link = (f'=hyperlink("https://myvirtualtikkun.com/?shul=cbssf&view=both'
-               f'&scroll={scroll_name_str}&parsha={parsha_en}", "Virtual Tikkun")')
+
+    def vt_header_link(scroll_cell):
+        """Virtual Tikkun link whose scroll= value references the scroll-name
+        cell, so editing that cell updates the link."""
+        return (f'=hyperlink("https://myvirtualtikkun.com/?shul=cbssf'
+                f'&view=both&scroll="&{scroll_cell}&"&parsha={parsha_en}", '
+                f'"Virtual Tikkun")')
+
     musaf_formula = ('=if(ISNUMBER(SEARCH("Richman",$A$2)), '
                      '"RDR default", "RAR default")')
     verse_summary = f"Full kriyah - {total_verses} verses (parsha={parsha_verses})"
@@ -521,7 +527,8 @@ def write_header(ws, parsha_data, scroll_name="Gunther", template_data=None):
         ws['E1'] = hebrew_date
         ws['B3'] = f"Kabbalat Shabbat {previous_date}"
         ws.cell(row=scroll_row + 1, column=2, value=scroll_name_str)
-        ws.cell(row=scroll_row + 1, column=3, value=vt_link)
+        ws.cell(row=scroll_row + 1, column=3,
+                value=vt_header_link(f"$B${scroll_row + 1}"))
         ws.cell(row=column_header_row + 1, column=2, value=verse_summary)
         ws['C6'] = musaf_formula
         if special_shabbat:
@@ -530,6 +537,7 @@ def write_header(ws, parsha_data, scroll_name="Gunther", template_data=None):
         return header_length + 1
 
     # ---- Fallback: original hardcoded layout ----
+    vt_link = vt_header_link("$B$13")
     header_data = [
         ["", parsha_en, "", gregorian_date, hebrew_date, ""],
         ["Rabbi Amanda Russell", "", "", special_shabbat or "", "", ""],
@@ -560,13 +568,17 @@ def write_header(ws, parsha_data, scroll_name="Gunther", template_data=None):
 
 
 def write_aliyot(ws, fullkriyah, parsha_data, start_row,
-                 page_numbers=None, scroll_name="Gunther"):
-    """Write the aliyot section starting at start_row. Returns the next row."""
+                 page_numbers=None, scroll_cell="$B$13"):
+    """Write the aliyot section starting at start_row. Returns the next row.
+
+    scroll_cell is the absolute reference to the cell holding the scroll
+    name (B13 in the standard layout); the Virtual Tikkun links reference it
+    so changing the scroll name updates every aliyah link automatically.
+    """
     if not fullkriyah:
         return start_row
 
     parsha_name = parsha_data['name']['en'] if parsha_data else ""
-    scroll_name_str = str(scroll_name) if scroll_name is not None else "Gunther"
 
     row = start_row
     color_index = 0
@@ -595,7 +607,7 @@ def write_aliyot(ws, fullkriyah, parsha_data, start_row,
                        if isinstance(aliyah_num, int) else aliyah_num)
         verse_info = format_verse_range(aliyah)
         vt_link = (f'=hyperlink("https://myvirtualtikkun.com/?shul=cbssf'
-                   f'&scroll={scroll_name_str}&parsha={parsha_name}'
+                   f'&scroll="&{scroll_cell}&"&parsha={parsha_name}'
                    f'&aliyah=A{aliyah_num}", "{display_num}")')
         emit(vt_link, display_num, verse_info)
 
@@ -603,7 +615,7 @@ def write_aliyot(ws, fullkriyah, parsha_data, start_row,
         maftir = fullkriyah['M']
         verse_info = format_verse_range(maftir)
         vt_link = (f'=hyperlink("https://myvirtualtikkun.com/?shul=cbssf'
-                   f'&scroll={scroll_name_str}&parsha={parsha_name}'
+                   f'&scroll="&{scroll_cell}&"&parsha={parsha_name}'
                    f'&aliyah=M", "Maf")')
         emit(vt_link, "Maf", verse_info)
 
@@ -796,10 +808,12 @@ def build_workbook(data, output_path, test_mode=False, page_numbers=None,
         next_row = write_header(ws, parsha_instance,
                                 scroll_name=scroll_name,
                                 template_data=template_data)
+        scroll_row_1based = (template_data['scroll_row'] + 1
+                             if template_data else 13)
         next_row = write_aliyot(ws, parsha_instance.get('fullkriyah', {}),
                                 parsha_instance, start_row=next_row,
                                 page_numbers=parsha_pages,
-                                scroll_name=scroll_name)
+                                scroll_cell=f"$B${scroll_row_1based}")
         write_footer(ws, start_row=next_row + 1,
                      page_numbers=parsha_pages,
                      template_data=template_data)
