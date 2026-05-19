@@ -1,1 +1,12 @@
+# Google API credentials / tokens (no longer used by leyning.py, but
+# kept locally for the leyning_sheets_backup.py fallback)
 credentials.json
+oauth_credentials.json
+save_credentials.json
+token.pickle
+*.pickle
+
+# OS / editor / Python noise
+.DS_Store
+.ipynb_checkpoints/
+__pycache__/
