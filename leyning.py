@@ -3,51 +3,117 @@ import json
 from datetime import datetime, timedelta
 import sys
 import argparse
-import gspread
-from google.oauth2.service_account import Credentials
 from collections import defaultdict
-import time
 from tenacity import retry, stop_after_attempt, wait_exponential
-from tqdm import tqdm
 import pandas as pd
+import os
 
-def set_column_widths(worksheet, verbose=False):
-    """Set the width of columns to match the template sheet."""
-    if verbose:
-        print("Setting column widths...")
-    
-    # Define column widths (in pixels) matched to template sheet
-    column_widths = [
-        ('A', 113),  # First column - for labels
-        ('B', 233),  # Second column - for parsha names and service parts
-        ('C', 184),  # Third column - for assignee names
-        ('D', 184),  # Fourth column - for dates and page numbers
-        ('E', 184),  # Fifth column - for Hebrew names
-        ('F', 442),  # Sixth column - for notes
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import range_boundaries
+
+# ---------------------------------------------------------------------------
+# Styling primitives
+# ---------------------------------------------------------------------------
+
+DEFAULT_FONT_NAME = 'Arial'
+DEFAULT_FONT_SIZE = 11
+
+# Background colors, expressed as the same 0-1 RGB the old gspread code used,
+# kept here so the fallback layout reproduces the original sheets exactly.
+GRAY = {'red': 0.9, 'green': 0.9, 'blue': 0.9}
+ORANGE = {'red': 1.0, 'green': 0.8, 'blue': 0.6}
+RED = {'red': 1.0, 'green': 0.8, 'blue': 0.8}
+GREEN = {'red': 0.8, 'green': 1.0, 'blue': 0.8}
+ALIYAH_COLORS = [
+    {'red': 1.0, 'green': 1.0, 'blue': 0.8},
+    {'red': 1.0, 'green': 0.8, 'blue': 1.0},
+    {'red': 0.8, 'green': 1.0, 'blue': 1.0},
+]
+
+
+def gcolor_to_argb(gcolor):
+    """Convert a {'red':0-1,'green':0-1,'blue':0-1} dict to an 'AARRGGBB' hex."""
+    def chan(v):
+        return format(max(0, min(255, round(v * 255))), '02X')
+    return 'FF' + chan(gcolor.get('red', 0)) + chan(gcolor.get('green', 0)) + chan(gcolor.get('blue', 0))
+
+
+def solid_fill(gcolor):
+    argb = gcolor_to_argb(gcolor)
+    return PatternFill(fill_type='solid', start_color=argb, end_color=argb)
+
+
+def font(size=DEFAULT_FONT_SIZE, bold=False):
+    return Font(name=DEFAULT_FONT_NAME, size=size, bold=bold)
+
+
+def style_range(ws, cell_range, fill=None, cell_font=None, alignment=None):
+    """Apply fill / font / alignment to every cell in an A1:F1 style range."""
+    min_col, min_row, max_col, max_row = range_boundaries(cell_range)
+    for r in range(min_row, max_row + 1):
+        for c in range(min_col, max_col + 1):
+            cell = ws.cell(row=r, column=c)
+            if fill is not None:
+                cell.fill = fill
+            if cell_font is not None:
+                cell.font = cell_font
+            if alignment is not None:
+                cell.alignment = alignment
+
+
+def write_cell(ws, row, col, value, size=DEFAULT_FONT_SIZE, bold=False,
+               fill=None, center=False):
+    """Write a value and apply the default Arial styling."""
+    cell = ws.cell(row=row, column=col, value=value)
+    cell.font = font(size=size, bold=bold)
+    if fill is not None:
+        cell.fill = fill
+    if center:
+        cell.alignment = Alignment(horizontal='center')
+    return cell
+
+
+def set_column_widths(ws, num_columns=6):
+    """Match the pixel widths the template sheet used (px -> char units)."""
+    # (column, pixel width) from the original Google Sheets template.
+    pixel_widths = [
+        ('A', 113), ('B', 233), ('C', 184),
+        ('D', 184), ('E', 184), ('F', 442),
     ]
-    
-    # Prepare the batch update request
-    requests = []
-    for col, width in column_widths:
-        col_index = ord(col) - ord('A')  # Convert column letter to 0-based index
-        requests.append({
-            'updateDimensionProperties': {
-                'range': {
-                    'sheetId': worksheet.id,
-                    'dimension': 'COLUMNS',
-                    'startIndex': col_index,
-                    'endIndex': col_index + 1
-                },
-                'properties': {
-                    'pixelSize': width
-                },
-                'fields': 'pixelSize'
-            }
-        })
-    
-    # Execute the batch update
-    worksheet.spreadsheet.batch_update({'requests': requests})
-    time.sleep(1)  # Small delay to respect rate limits
+    for col, px in pixel_widths[:num_columns]:
+        # openpyxl width is in character units; ~7px per unit, +5px padding.
+        ws.column_dimensions[col].width = round((px - 5) / 7, 2)
+
+
+def sanitize_sheet_name(name, used):
+    """Make an Excel-legal, unique worksheet title (<=31 chars, no []:*?/\\)."""
+    for ch in '[]:*?/\\':
+        name = name.replace(ch, '-')
+    name = name.strip() or 'Sheet'
+    name = name[:31]
+    candidate = name
+    i = 2
+    while candidate in used:
+        suffix = f' ({i})'
+        candidate = name[:31 - len(suffix)] + suffix
+        i += 1
+    used.add(candidate)
+    return candidate
+
+
+# ---------------------------------------------------------------------------
+# Data helpers (unchanged from the Sheets implementation)
+# ---------------------------------------------------------------------------
+
+def find_marker_in_column(data, column_index, marker_text):
+    """Search for marker text in a specific column. Returns 0-based row index."""
+    for row_idx, row in enumerate(data):
+        if column_index < len(row) and row[column_index] == marker_text:
+            return row_idx
+    return None
+
 
 def int_to_roman(num):
     """Convert integer to Roman numeral."""
@@ -63,37 +129,35 @@ def int_to_roman(num):
             num -= value
     return result
 
+
 def format_verse_range(aliyah):
     """Format verse range with verse count."""
     try:
         book = aliyah['k']
-        
-        # Parse beginning verse reference
+
         start_parts = aliyah['b'].split(':')
         start_chapter = start_parts[0]
         start_verse = start_parts[1]
-        
-        # Parse ending verse reference
+
         end_parts = aliyah['e'].split(':')
         end_chapter = end_parts[0]
         end_verse = end_parts[1]
-        
-        # Format the range based on whether chapters are the same
+
         if start_chapter == end_chapter:
             verse_range = f"{start_chapter}:{start_verse}-{end_verse}"
         else:
             verse_range = f"{start_chapter}:{start_verse}-{end_chapter}:{end_verse}"
-        
-        # Add verse count if available
+
         if 'v' in aliyah:
             return f"{book} {verse_range} ({aliyah['v']})"
         else:
             return f"{book} {verse_range}"
-            
+
     except (KeyError, IndexError, AttributeError) as e:
         print(f"Error formatting verse range: {e}")
         print(f"Aliyah data: {aliyah}")
         return "Error formatting verse range"
+
 
 def get_reading_type(name):
     """Determine the type of reading based on the name."""
@@ -106,6 +170,7 @@ def get_reading_type(name):
         return 'chol_hamoed'
     return 'regular'
 
+
 def is_special_day(name):
     """Check if this is a special day that should be included in minyan readings."""
     name_lower = name.lower()
@@ -117,609 +182,659 @@ def is_special_day(name):
         'taanit'
     ])
 
+
 def load_page_numbers(csv_path):
     """Load page numbers from CSV file."""
-    import pandas as pd
-    
     df = pd.read_csv(csv_path)
-    # Rename column if old spelling exists
     if 'Haftara verses' in df.columns:
         df = df.rename(columns={'Haftara verses': 'Haftarah verses'})
     return df.set_index('Parsha').to_dict('index')
 
 
-def write_header(worksheet, parsha_data, verbose=False):
-    """Write header section (rows 1-14) with support for special Shabbats."""
-    # Parse and format dates
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+def get_leyning(start_date, end_date, verbose=False):
+    """Fetch leyning data from HebCal API with retry logic."""
+    url = f"https://www.hebcal.com/leyning?cfg=json&start={start_date}&end={end_date}"
+    if verbose:
+        print(f"Fetching data from {url}")
+    response = requests.get(url)
+    response.raise_for_status()
+    return response.json()
+
+
+# ---------------------------------------------------------------------------
+# Local .xlsx template loading
+# ---------------------------------------------------------------------------
+
+def _cell_style(cell):
+    """Capture the fill / font-size / bold / alignment of a template cell."""
+    style = {}
+    fill = cell.fill
+    if fill is not None and fill.fill_type == 'solid':
+        rgb = getattr(fill.start_color, 'rgb', None)
+        if isinstance(rgb, str) and len(rgb) == 8:
+            style['fill_argb'] = rgb
+    if cell.font is not None:
+        if cell.font.size:
+            style['size'] = cell.font.size
+        style['bold'] = bool(cell.font.bold)
+    if cell.alignment is not None and cell.alignment.horizontal:
+        style['horizontal'] = cell.alignment.horizontal
+    return style
+
+
+def _read_template_sheet(ws, max_cols=6):
+    """Return (values, styles) grids for a template worksheet."""
+    values, styles = [], []
+    for row in ws.iter_rows(min_col=1, max_col=max_cols):
+        v_row, s_row = [], []
+        for cell in row:
+            v_row.append(cell.value if cell.value is not None else "")
+            s_row.append(_cell_style(cell))
+        values.append(v_row)
+        styles.append(s_row)
+    return values, styles
+
+
+def load_template(template_path, verbose=False):
+    """
+    Load a local .xlsx template and detect dynamic dimensions.
+
+    The template must have a 'Header' sheet and a 'Footer' sheet. Marker cells
+    drive dynamic positioning so the layout can change without code edits:
+      - "Torah(s) Scroll" in column A of Header marks the scroll row
+      - "Reader"/"Aliyah"/"Hebrew Name(s)"/"Notes" in C-F marks the last
+        header row (aliyot begin on the next row)
+
+    Returns a dict with header/footer value + style grids and the detected
+    indices, or raises if the file/markers are missing.
+    """
+    if verbose:
+        print(f"Loading template: {template_path}", file=sys.stderr)
+
+    wb = load_workbook(template_path, data_only=True)
+    for required in ('Header', 'Footer'):
+        if required not in wb.sheetnames:
+            raise ValueError(f"Template is missing required sheet: '{required}'")
+
+    header_values, header_styles = _read_template_sheet(wb['Header'])
+    footer_values, footer_styles = _read_template_sheet(wb['Footer'])
+
+    scroll_row = find_marker_in_column(header_values, 0, "Torah(s) Scroll")
+    if scroll_row is None:
+        raise ValueError("Template Header must contain 'Torah(s) Scroll' in column A")
+
+    column_header_row = find_marker_in_column(header_values, 2, "Reader")
+    if column_header_row is None:
+        raise ValueError("Template Header must contain 'Reader' in column C")
+
+    row = header_values[column_header_row]
+    required_markers = {3: "Aliyah", 4: "Hebrew Name(s)", 5: "Notes"}
+    for col_idx, marker in required_markers.items():
+        if col_idx >= len(row) or row[col_idx] != marker:
+            raise ValueError(
+                f"Template Header row {column_header_row + 1} must contain "
+                f"'{marker}' in column {get_column_letter(col_idx + 1)}")
+
+    header_length = column_header_row + 1
+
+    # Footer length = index of last non-empty row + 1 (keeps internal/leading
+    # blank spacer rows, trims trailing blanks).
+    footer_length = 0
+    for idx, frow in enumerate(footer_values):
+        if any(str(c).strip() for c in frow):
+            footer_length = idx + 1
+
+    if verbose:
+        print(f"Template loaded: {template_path}", file=sys.stderr)
+        print(f"  Header length: {header_length} rows", file=sys.stderr)
+        print(f"  Torah Scroll row: {scroll_row + 1}", file=sys.stderr)
+        print(f"  Column header row: {column_header_row + 1}", file=sys.stderr)
+        print(f"  Footer length: {footer_length} rows", file=sys.stderr)
+
+    return {
+        'header_values': header_values,
+        'header_styles': header_styles,
+        'header_length': header_length,
+        'scroll_row': scroll_row,
+        'column_header_row': column_header_row,
+        'footer_values': footer_values,
+        'footer_styles': footer_styles,
+        'footer_length': footer_length,
+    }
+
+
+def copy_block(ws, values, styles, start_row, num_rows, num_cols=6):
+    """Copy a template value+style block onto the worksheet at start_row."""
+    for i in range(num_rows):
+        src_vals = values[i] if i < len(values) else []
+        src_styles = styles[i] if i < len(styles) else []
+        for c in range(num_cols):
+            value = src_vals[c] if c < len(src_vals) else ""
+            style = src_styles[c] if c < len(src_styles) else {}
+            cell = ws.cell(row=start_row + i, column=c + 1, value=value)
+            cell.font = font(size=style.get('size', DEFAULT_FONT_SIZE),
+                             bold=style.get('bold', False))
+            if 'fill_argb' in style:
+                argb = style['fill_argb']
+                cell.fill = PatternFill(fill_type='solid',
+                                        start_color=argb, end_color=argb)
+            if 'horizontal' in style:
+                cell.alignment = Alignment(horizontal=style['horizontal'])
+
+
+# ---------------------------------------------------------------------------
+# Section writers
+# ---------------------------------------------------------------------------
+
+def write_header(ws, parsha_data, scroll_name="Gunther", template_data=None):
+    """
+    Write the header section. Returns the next available row (1-based).
+
+    Uses the loaded template when available, otherwise falls back to the
+    original hardcoded 14-row layout.
+    """
     full_date = datetime.strptime(parsha_data['date'], '%Y-%m-%d')
-    gregorian_date = full_date.strftime('%B %-d')  # e.g., "January 4"
-    previous_date = (full_date - timedelta(days=1)).strftime('%B %-d')  # For Kabbalat Shabbat
-    
-    # Parse Hebrew date to get just month and day
-    hebrew_date_parts = parsha_data['hdate'].split()  # e.g., "26 Tevet 5784"
-    hebrew_date = f"{hebrew_date_parts[1]} {hebrew_date_parts[0]}"  # e.g., "Tevet 26"
-    
-    # Check for special Shabbat
+    gregorian_date = full_date.strftime('%B %-d')
+    previous_date = (full_date - timedelta(days=1)).strftime('%B %-d')
+
+    hebrew_date_parts = parsha_data['hdate'].split()
+    hebrew_date = f"{hebrew_date_parts[1]} {hebrew_date_parts[0]}"
+
+    total_verses = 0
+    parsha_verses = 0
+    if 'fullkriyah' in parsha_data:
+        for key, aliyah in parsha_data['fullkriyah'].items():
+            verses = aliyah.get('v', 0)
+            total_verses += verses
+            if key != 'M':
+                parsha_verses += verses
+
     special_shabbat = None
-    # Check top-level reason.haftara
     if isinstance(parsha_data.get('reason'), dict):
         special_shabbat = parsha_data['reason'].get('haftara')
-    # Check haft.reason if no top-level reason found
     if not special_shabbat and 'haft' in parsha_data:
         haft = parsha_data['haft']
         if isinstance(haft, dict):
             special_shabbat = haft.get('reason')
         elif isinstance(haft, list):
-            # If it's a list, check each haftarah entry for a reason
             for h in haft:
                 if isinstance(h, dict) and 'reason' in h:
                     special_shabbat = h['reason']
                     break
-    
-    # Calculate verse counts for Row 14
-    total_verses = 0
-    parsha_verses = 0
-    if 'fullkriyah' in parsha_data:
-        for key, aliyah in parsha_data['fullkriyah'].items():
-            if key != 'M':  # Don't include Maftir in parsha verses
-                verses = aliyah.get('v', 0)
-                total_verses += verses
-                parsha_verses += verses
-            elif key == 'M':  # Add Maftir to total but not parsha verses
-                total_verses += aliyah.get('v', 0)
-    
-    # Prepare header data with special Shabbat in D2 if present
+
+    scroll_name_str = str(scroll_name) if scroll_name is not None else "Gunther"
+    parsha_en = parsha_data['name']['en']
+    vt_link = (f'=hyperlink("https://myvirtualtikkun.com/?shul=cbssf&view=both'
+               f'&scroll={scroll_name_str}&parsha={parsha_en}", "Virtual Tikkun")')
+    musaf_formula = ('=if(ISNUMBER(SEARCH("Richman",$A$2)), '
+                     '"RDR default", "RAR default")')
+    verse_summary = f"Full kriyah - {total_verses} verses (parsha={parsha_verses})"
+
+    if template_data:
+        header_length = template_data['header_length']
+        scroll_row = template_data['scroll_row']
+        column_header_row = template_data['column_header_row']
+
+        copy_block(ws, template_data['header_values'],
+                   template_data['header_styles'], 1, header_length)
+
+        # Overwrite dynamic cells (styling from the template is preserved
+        # because copy_block already set the font/fill on these cells).
+        ws['B1'] = parsha_en
+        ws['D1'] = gregorian_date
+        ws['E1'] = hebrew_date
+        ws['B3'] = f"Kabbalat Shabbat {previous_date}"
+        ws.cell(row=scroll_row + 1, column=2, value=scroll_name_str)
+        ws.cell(row=scroll_row + 1, column=3, value=vt_link)
+        ws.cell(row=column_header_row + 1, column=2, value=verse_summary)
+        ws['C6'] = musaf_formula
+        if special_shabbat:
+            ws['D2'] = special_shabbat
+
+        return header_length + 1
+
+    # ---- Fallback: original hardcoded layout ----
     header_data = [
-        ["", parsha_data['name']['en'], "", gregorian_date, hebrew_date],  # Row 1
-        ["Rabbi Amanda Russell", "", "", special_shabbat if special_shabbat else "", ""],  # Row 2 - Add special Shabbat
-        ["Service leaders", f"Kabbalat Shabbat {previous_date}", "", "", ""],  # Row 3
-        ["", "P'sukei D'zimrah", "", "", ""],  # Row 4
-        ["", "Shacharit", "", "", ""],  # Row 5
-        ["", "Musaf", "", "", ""],  # Row 6 (formula will be added separately)
-        ["", "Torah Service", "", "", ""],  # Row 7
-        ["", "Gabbai", "Sam (default)", "", ""],  # Row 8
-        ["", "Distribute honors", "Todd (default)", "", ""],  # Row 9
-        ["", "Read announcements", "Jerilyn (default)", "", ""],  # Row 10
-        ["Board hosts", "", "", "", ""],  # Row 11
-        ["", "", "", "", ""],  # Row 12
-        ["Torah(s) Scroll", "Neuhas", "", "", ""],  # Row 13
-        ["", f"Full kriyah - {total_verses} verses (parsha={parsha_verses})", "Reader", "Aliyah", "Hebrew Name(s)", "Notes"]  # Row 14
+        ["", parsha_en, "", gregorian_date, hebrew_date, ""],
+        ["Rabbi Amanda Russell", "", "", special_shabbat or "", "", ""],
+        ["Service leaders", f"Kabbalat Shabbat {previous_date}", "", "", "", ""],
+        ["", "P'sukei D'zimrah", "", "", "", ""],
+        ["", "Shacharit", "", "", "", ""],
+        ["", "Musaf", musaf_formula, "", "", ""],
+        ["", "Torah Service", "", "", "", ""],
+        ["", "Gabbai", "Sam (default)", "", "", ""],
+        ["", "Distribute honors", "Todd (default)", "", "", ""],
+        ["", "Read announcements", "Jerilyn (default)", "", "", ""],
+        ["Board hosts", "", "", "", "", ""],
+        ["", "", "", "", "", ""],
+        ["Torah(s) Scroll", scroll_name_str, vt_link, "", "", ""],
+        ["", verse_summary, "Reader", "Aliyah", "Hebrew Name(s)", "Notes"],
     ]
-    
-    # Batch update all data
-    worksheet.batch_update([{
-        'range': 'A1:F14',
-        'values': header_data
-    }])
-    time.sleep(5)  # Respect rate limits
-    
-    # Update the formula cell separately using update_acell
-    formula = '=if(ISNUMBER(SEARCH("Richman",$A$2)), "RDR default", "RAR default")'
-    worksheet.update_acell('C6', formula)
-    time.sleep(5)  # Respect rate limits
-    
-    # Apply formatting
-    formats = [
-        # Row 1 - 24pt font
-        {
-            'range': 'A1:F1',
-            'format': {'textFormat': {'fontSize': 24}}
-        },
-        # Row 2 - 14pt font (including special Shabbat in D2)
-        {
-            'range': 'A2:F2',
-            'format': {'textFormat': {'fontSize': 14}}
-        },
-        # Row 3 "Service leaders" - gray background
-        {
-            'range': 'A3',
-            'format': {'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}}
-        },
-        # Row 11 "Board hosts" - gray background
-        {
-            'range': 'A11',
-            'format': {'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}}
-        },
-        # Row 13 "Torah(s) Scroll" and "Neuhas" - orange background
-        {
-            'range': 'A13:B13',
-            'format': {'backgroundColor': {'red': 1.0, 'green': 0.8, 'blue': 0.6}}
-        },
-        # Row 14 - gray background for all cells
-        {
-            'range': 'A14:F14',
-            'format': {'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}}
-        }
-    ]
-    
-    # Apply each format
-    for format_spec in formats:
-        worksheet.format(format_spec['range'], format_spec['format'])
-        time.sleep(5)  # Respect rate limits
-                      
-def write_aliyot(worksheet, fullkriyah, parsha_data, page_numbers=None):
-   """Write aliyot section (rows 15-23)."""
-   if not fullkriyah:
-       return
-   
-   total_verses = 0
-   parsha_verses = 0
-   if fullkriyah:
-       for key, aliyah in fullkriyah.items():
-           if key != 'M':
-               verses = aliyah.get('v', 0)
-               total_verses += verses
-               parsha_verses += verses
-           elif key == 'M':
-               total_verses += aliyah.get('v', 0)
-   
-   worksheet.update(
-       values=[[
-           "",
-           f"Full kriyah - {total_verses} verses (parsha={parsha_verses})", 
-           "Reader",
-           "Aliyah",
-           "Hebrew Name(s)",
-           "Notes"
-       ]],
-       range_name='A14:F14'
-   )
-   time.sleep(5)
-   
-   colors = [
-       {'red': 1.0, 'green': 1.0, 'blue': 0.8},
-       {'red': 1.0, 'green': 0.8, 'blue': 1.0},
-       {'red': 0.8, 'green': 1.0, 'blue': 1.0},
-   ]
-   
-   row = 15
-   color_index = 0
-   
-   for key in sorted(fullkriyah.keys()):
-       if key == 'M':
-           continue
-           
-       aliyah = fullkriyah[key]
-       aliyah_num = int(key) if key.isdigit() else key
-       display_num = int_to_roman(int(aliyah_num)) if isinstance(aliyah_num, int) else aliyah_num
-       verse_info = format_verse_range(aliyah)
-       
-       worksheet.update(
-           values=[[
-               display_num,
-               verse_info,
-               "",
-               "",
-               "",
-               ""
-           ]],
-           range_name=f'A{row}:F{row}'
-       )
-       
-       worksheet.format(f'A{row}:C{row}', {
-           'backgroundColor': colors[color_index]
-       })
-       worksheet.format(f'A{row}', {
-           'horizontalAlignment': 'CENTER'
-       })
-       
-       time.sleep(5)
-       color_index = (color_index + 1) % 3
-       row += 1
-   
-   if 'M' in fullkriyah:
-       maftir = fullkriyah['M']
-       verse_info = format_verse_range(maftir)
-       
-       worksheet.update(
-           values=[[
-               "Maf",
-               verse_info,
-               "",
-               "",
-               "",
-               ""
-           ]],
-           range_name=f'A{row}:F{row}'
-       )
-       
-       worksheet.format(f'A{row}:C{row}', {
-           'backgroundColor': colors[color_index]
-       })
-       worksheet.format(f'A{row}', {
-           'horizontalAlignment': 'CENTER'
-       })
-       
-       time.sleep(5)
-       color_index = (color_index + 1) % 3
-       row += 1
-   
-   if parsha_data:
-       if page_numbers and pd.notna(page_numbers.get('Haftarah verses')):
-           verse_info = page_numbers['Haftarah verses']
-       elif 'haft' in parsha_data:
-           haftarah_parts = parsha_data['haft']
-           if isinstance(haftarah_parts, list):
-               verse_parts = []
-               total_verses = 0
-               for part in haftarah_parts:
-                   verse_parts.append(f"{part['b']}-{part['e']}")
-                   total_verses += part['v']
-               book = haftarah_parts[0]['k']
-               verse_info = f"{book} {', '.join(verse_parts)} ({total_verses})"
-           else:
-               part = haftarah_parts
-               verse_info = f"{part['k']} {part['b']}-{part['e']} ({part['v']})"
-       
-       worksheet.update(
-           values=[[
-               "Haf",
-               verse_info,
-               "",
-               "",
-               "",
-               ""
-           ]],
-           range_name=f'A{row}:F{row}'
-       )
-       
-       worksheet.format(f'A{row}:C{row}', {
-           'backgroundColor': colors[color_index]
-       })
-       worksheet.format(f'A{row}', {
-           'horizontalAlignment': 'CENTER'
-       })
-       
-       time.sleep(5)
-       
-def write_footer(worksheet, page_numbers=None, verbose=False):
-    """Write footer section (rows 24-34)."""
+    for r, row_vals in enumerate(header_data, start=1):
+        size = 24 if r == 1 else 14 if r == 2 else DEFAULT_FONT_SIZE
+        for c, value in enumerate(row_vals, start=1):
+            write_cell(ws, r, c, value, size=size)
+
+    style_range(ws, 'A3:A3', fill=solid_fill(GRAY))
+    style_range(ws, 'A11:A11', fill=solid_fill(GRAY))
+    style_range(ws, 'A13:B13', fill=solid_fill(ORANGE))
+    style_range(ws, 'A14:F14', fill=solid_fill(GRAY))
+
+    return 15
+
+
+def write_aliyot(ws, fullkriyah, parsha_data, start_row,
+                 page_numbers=None, scroll_name="Gunther"):
+    """Write the aliyot section starting at start_row. Returns the next row."""
+    if not fullkriyah:
+        return start_row
+
+    parsha_name = parsha_data['name']['en'] if parsha_data else ""
+    scroll_name_str = str(scroll_name) if scroll_name is not None else "Gunther"
+
+    row = start_row
+    color_index = 0
+
+    def emit(label_formula, display_text, verse_info):
+        nonlocal row, color_index
+        fill = solid_fill(ALIYAH_COLORS[color_index])
+        a = write_cell(ws, row, 1,
+                       label_formula if label_formula else display_text,
+                       fill=fill, center=True)
+        if label_formula:
+            a.alignment = Alignment(horizontal='center')
+        write_cell(ws, row, 2, verse_info, fill=fill)
+        write_cell(ws, row, 3, "", fill=fill)
+        for c in range(4, 7):
+            write_cell(ws, row, c, "")
+        color_index = (color_index + 1) % 3
+        row += 1
+
+    for key in sorted(fullkriyah.keys()):
+        if key == 'M':
+            continue
+        aliyah = fullkriyah[key]
+        aliyah_num = int(key) if key.isdigit() else key
+        display_num = (int_to_roman(int(aliyah_num))
+                       if isinstance(aliyah_num, int) else aliyah_num)
+        verse_info = format_verse_range(aliyah)
+        vt_link = (f'=hyperlink("https://myvirtualtikkun.com/?shul=cbssf'
+                   f'&scroll={scroll_name_str}&parsha={parsha_name}'
+                   f'&aliyah=A{aliyah_num}", "{display_num}")')
+        emit(vt_link, display_num, verse_info)
+
+    if 'M' in fullkriyah:
+        maftir = fullkriyah['M']
+        verse_info = format_verse_range(maftir)
+        vt_link = (f'=hyperlink("https://myvirtualtikkun.com/?shul=cbssf'
+                   f'&scroll={scroll_name_str}&parsha={parsha_name}'
+                   f'&aliyah=M", "Maf")')
+        emit(vt_link, "Maf", verse_info)
+
+    if parsha_data:
+        verse_info = ""
+        if page_numbers and pd.notna(page_numbers.get('Haftarah verses')):
+            verse_info = page_numbers['Haftarah verses']
+        elif 'haft' in parsha_data:
+            haftarah_parts = parsha_data['haft']
+            if isinstance(haftarah_parts, list):
+                verse_parts = []
+                total = 0
+                for part in haftarah_parts:
+                    verse_parts.append(f"{part['b']}-{part['e']}")
+                    total += part['v']
+                book = haftarah_parts[0]['k']
+                verse_info = f"{book} {', '.join(verse_parts)} ({total})"
+            else:
+                part = haftarah_parts
+                verse_info = f"{part['k']} {part['b']}-{part['e']} ({part['v']})"
+        emit(None, "Haf", verse_info)
+
+    return row
+
+
+def write_footer(ws, start_row, page_numbers=None, template_data=None):
+    """Write the footer section starting at start_row."""
     if page_numbers:
-        torah_page = f"Torah page {str(int(page_numbers['Torah Page']))}"\
-            if pd.notna(page_numbers.get('Torah Page')) else "Torah page"
-        haftarah_page = f"Haftarah page {str(int(page_numbers['Haftarah Page']))}"\
-            if pd.notna(page_numbers.get('Haftarah Page')) else "Haftarah page"
+        torah_page = (f"Torah page {str(int(page_numbers['Torah Page']))}"
+                      if pd.notna(page_numbers.get('Torah Page')) else "Torah page")
+        haftarah_page = (f"Haftarah page {str(int(page_numbers['Haftarah Page']))}"
+                         if pd.notna(page_numbers.get('Haftarah Page'))
+                         else "Haftarah page")
     else:
         torah_page = "Torah page"
         haftarah_page = "Haftarah page"
 
+    if template_data:
+        footer_values = template_data['footer_values']
+        footer_styles = template_data['footer_styles']
+        footer_length = template_data['footer_length']
+
+        copy_block(ws, footer_values, footer_styles, start_row, footer_length)
+
+        # Page numbers go in column D, on the two rows after the "Etz Hayyim"
+        # honors header (detected so template edits stay safe).
+        etz_idx = None
+        for idx in range(footer_length):
+            row_vals = footer_values[idx] if idx < len(footer_values) else []
+            if len(row_vals) > 3 and str(row_vals[3]).strip() == "Etz Hayyim":
+                etz_idx = idx
+                break
+        if etz_idx is None:
+            etz_idx = 1  # original layout: blank row, then honors header
+        ws.cell(row=start_row + etz_idx + 1, column=4, value=torah_page)
+        ws.cell(row=start_row + etz_idx + 2, column=4, value=haftarah_page)
+        return
+
+    # ---- Fallback: original hardcoded layout ----
     footer_data = [
-        ["", "", "", "", "", ""],  # Row 24 (blank)
-        ["", "Honors", "", "Etz Hayyim", "", ""],  # Row 25
-        ["P'ticha 1", "", "", torah_page, "", ""],  # Row 26
-        ["P'ticha 2", "", "", haftarah_page, "", ""],  # Row 27
-        ["Hagbah", "", "", "", "", ""],  # Row 28
-        ["G'lilah", "", "", "", "", ""],  # Row 29
-        ["Prayer for Country", "", "", "", "", ""],  # Row 30
-        ["Prayer for Israel", "", "", "", "", ""],  # Row 31
-        ["Prayer for Peace", "", "", "", "", ""],  # Row 32
-        ["Anim Zmerot", "", "", "", "", ""],  # Row 33
-        ["Adon Olam", "", "", "", "", ""]  # Row 34
+        ["", "", "", "", "", ""],
+        ["", "Honors", "", "Etz Hayyim", "", ""],
+        ["P'ticha 1", "", "", torah_page, "", ""],
+        ["P'ticha 2", "", "", haftarah_page, "", ""],
+        ["Hagbah", "", "", "", "", ""],
+        ["G'lilah", "", "", "", "", ""],
+        ["Prayer for Country", "", "", "", "", ""],
+        ["Prayer for Israel", "", "", "", "", ""],
+        ["Prayer for Peace", "", "", "", "", ""],
+        ["Anim Zmerot", "", "", "", "", ""],
+        ["Adon Olam", "", "", "", "", ""],
     ]
+    for i, row_vals in enumerate(footer_data):
+        for c, value in enumerate(row_vals, start=1):
+            write_cell(ws, start_row + i, c, value)
 
-    range_name = 'A24:F34'
-    worksheet.batch_update([{
-        'range': range_name,
-        'values': footer_data
-    }])
-    time.sleep(5)
-
-    gray_format = {
-        'backgroundColor': {'red': 0.9, 'green': 0.9, 'blue': 0.9}
-    }
-    
-    for cell in ['A25', 'B25', 'D25']:
-        worksheet.format(cell, gray_format)
-        time.sleep(5)
-        
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-def get_leyning(start_date, end_date, verbose=False):
-    """
-    Fetch leyning data from HebCal API with retry logic
-    """
-    url = f"https://www.hebcal.com/leyning?cfg=json&start={start_date}&end={end_date}"
-    
-    if verbose:
-        print(f"Fetching data from {url}")
-    
-    response = requests.get(url)
-    response.raise_for_status()
-    
-    return response.json()
-
-def set_global_format(worksheet, verbose=False):
-    """Set global formatting rules for the worksheet."""
-    if verbose:
-        print("Applying global formatting...")
-    
-    # Set default font and size for the entire sheet
-    worksheet.format(
-        'A1:F1000',  # Apply to a large range to cover all potential cells
-        {
-            'textFormat': {
-                'fontFamily': 'Arial',
-                'fontSize': 11
-            },
-            'wrapStrategy': 'OVERFLOW_CELL'  # Text will overflow into adjacent cells
-        }
-    )
-    time.sleep(5)  # Respect rate limits
+    gray = solid_fill(GRAY)
+    header_row = start_row + 1
+    for col in (1, 2, 4):
+        ws.cell(row=header_row, column=col).fill = gray
 
 
-def write_minyan(worksheet, parsha_data, verbose=False):
-    """Update worksheet with weekday Torah readings and special days."""
-    if verbose:
-        print("Updating Minyan readings tab...")
+def write_minyan(ws, parsha_data):
+    """Write weekday Torah readings and special days to the Minyan sheet."""
+    set_column_widths(ws, num_columns=4)
 
-    # Clear existing content and set formatting
-    worksheet.clear()
-    time.sleep(5)
-    set_global_format(worksheet, verbose)
-    set_column_widths(worksheet, verbose)
-
-    # Define background colors
-    GRAY_BG = {'red': 0.9, 'green': 0.9, 'blue': 0.9}  # Regular headers
-    RED_BG = {'red': 1.0, 'green': 0.8, 'blue': 0.8}   # Fast days
-    GREEN_BG = {'red': 0.8, 'green': 1.0, 'blue': 0.8} # Rosh Chodesh and Chol Ha-moed
-
-    # Collect all relevant readings in chronological order
     readings = []
     for item in parsha_data['items']:
-        # Skip regular parsha readings that aren't weekday readings
-        if not ('weekday' in item or 'fullkriyah' in item and is_special_day(item['name']['en'])):
+        if not ('weekday' in item
+                or ('fullkriyah' in item and is_special_day(item['name']['en']))):
             continue
-            
-        reading_type = get_reading_type(item['name']['en'])
         readings.append({
             'readings': item.get('weekday', item.get('fullkriyah', {})),
             'parsha_name': item['name']['en'],
             'date': item['date'],
             'hdate': item['hdate'],
-            'type': reading_type
+            'type': get_reading_type(item['name']['en']),
         })
-    
-    # Sort by date
-    readings.sort(key=lambda x: x['date'])
 
+    readings.sort(key=lambda x: x['date'])
     if not readings:
-        if verbose:
-            print("No readings found")
         return
 
-    # Prepare all rows for batch update
     all_rows = []
-    header_rows = []  # Keep track of which rows are headers
-    
-    # Write each reading
+    header_rows = []
     for reading_info in readings:
         date_obj = datetime.strptime(reading_info['date'], '%Y-%m-%d')
-        
-        # Format dates
         secular_date = date_obj.strftime('%b %d')
-        hebrew_date = ' '.join(reading_info['hdate'].split()[:-1])  # Remove year
-        
-        # Record this as a header row
+        hebrew_date = ' '.join(reading_info['hdate'].split()[:-1])
+
         header_rows.append(len(all_rows))
-        
-        # Add header row
-        all_rows.append([
-            secular_date,
-            hebrew_date, 
-            reading_info['parsha_name'],
-            date_obj.strftime('%A')
-        ])
-        
-        # Add aliyah readings
+        all_rows.append([secular_date, hebrew_date,
+                         reading_info['parsha_name'], date_obj.strftime('%A')])
+
         for aliyah_num, reading in reading_info['readings'].items():
-            if aliyah_num != 'M':  # Skip Maftir for weekday readings
-                roman_num = int_to_roman(int(aliyah_num)) if aliyah_num.isdigit() else aliyah_num
-                verse_info = format_verse_range(reading)
-                all_rows.append([roman_num, verse_info, '', ''])
-        
-        # Add blank row between sections
+            if aliyah_num != 'M':
+                roman_num = (int_to_roman(int(aliyah_num))
+                             if aliyah_num.isdigit() else aliyah_num)
+                all_rows.append([roman_num, format_verse_range(reading), '', ''])
+
         all_rows.append(['', '', '', ''])
 
-    # Write all data at once
-    range_name = f'A1:D{len(all_rows)}'
-    worksheet.batch_update([{
-        'range': range_name,
-        'values': all_rows
-    }])
-    time.sleep(5)
+    for r, row_vals in enumerate(all_rows, start=1):
+        for c, value in enumerate(row_vals, start=1):
+            write_cell(ws, r, c, value)
 
-    # Apply formatting
-    for i, (reading_info, header_row) in enumerate(zip(readings, header_rows)):
-        # Determine background color based on reading type
+    for reading_info, header_row in zip(readings, header_rows):
         if reading_info['type'] == 'fast_day':
-            bg_color = RED_BG
-        elif reading_info['type'] in ['rosh_chodesh', 'chol_hamoed']:
-            bg_color = GREEN_BG
+            bg = RED
+        elif reading_info['type'] in ('rosh_chodesh', 'chol_hamoed'):
+            bg = GREEN
         else:
-            bg_color = GRAY_BG
+            bg = GRAY
 
-        # Format header - add 1 because sheet rows are 1-based
-        worksheet.format(f'A{header_row + 1}:D{header_row + 1}', {
-            'backgroundColor': bg_color,
-            'textFormat': {'bold': True},
-            'horizontalAlignment': 'CENTER'
-        })
-        time.sleep(1)
-        
-        # Center align aliyah numbers for this section
-        start_row = header_row + 2  # First aliyah row
-        
-        # Find end of current section by looking for the next blank row
-        end_row = start_row
-        while end_row < len(all_rows) and (end_row == start_row or any(all_rows[end_row-1])):
-            if all_rows[end_row-1][0]:  # If there's content in column A
-                worksheet.format(f'A{end_row}', {
-                    'horizontalAlignment': 'CENTER'
-                })
-                time.sleep(1)
-            end_row += 1
+        hr = header_row + 1  # 1-based
+        style_range(ws, f'A{hr}:D{hr}', fill=solid_fill(bg),
+                    cell_font=font(bold=True),
+                    alignment=Alignment(horizontal='center'))
+
+        start = header_row + 2
+        end = start
+        while end < len(all_rows) and (end == start or any(all_rows[end - 1])):
+            if all_rows[end - 1][0]:
+                ws.cell(row=end, column=1).alignment = Alignment(horizontal='center')
+            end += 1
+
+
+# ---------------------------------------------------------------------------
+# Workbook builder
+# ---------------------------------------------------------------------------
+
+def build_workbook(data, output_path, test_mode=False, page_numbers=None,
+                   scroll_name="Gunther", verbose=False, template_data=None):
+    """Build the leyning workbook locally and save it to output_path."""
+    parsha_data = defaultdict(list)
+    for item in data['items']:
+        parsha_name = item['name']['en']
+        if not is_special_day(parsha_name):
+            parsha_data[parsha_name].append(item)
+
+    if test_mode and parsha_data:
+        first_parsha = next(iter(parsha_data))
+        parsha_data = {first_parsha: parsha_data[first_parsha]}
+        if verbose:
+            print(f"Test mode: Processing only parsha {first_parsha}")
+
+    wb = Workbook()
+    used_names = set()
+
+    minyan_ws = wb.active
+    minyan_ws.title = sanitize_sheet_name("Minyan", used_names)
+    write_minyan(minyan_ws, data)
 
     if verbose:
-        print("Minyan readings tab updated successfully")
+        print(f"Minyan tab complete. Processing {len(parsha_data)} parshas...",
+              file=sys.stderr)
 
-def write_to_sheets(data, sheet_name, user_email, test_mode=False, page_numbers=None, verbose=False):
-   """
-   Write leyning data to Google Sheets, with separate tabs for each parsha
-   """
-   try:
-       scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-       credentials = Credentials.from_service_account_file('credentials.json', scopes=scopes)
-       gc = gspread.authorize(credentials)
+    for parsha_name, items in parsha_data.items():
+        if verbose:
+            print(f"Processing {parsha_name}")
 
-       if verbose:
-           print(f"Connecting to Google Sheets: {sheet_name}")
+        parsha_instance = next(
+            (item for item in items if 'fullkriyah' in item), items[0])
 
-       try:
-           spreadsheet = gc.open(sheet_name)
-           if verbose:
-               print("Found existing spreadsheet")
-       except gspread.SpreadsheetNotFound:
-           spreadsheet = gc.create(sheet_name)
-           if verbose:
-               print("Created new spreadsheet")
-       
-       spreadsheet.share(None, perm_type='anyone', role='writer', with_link=True)
-       if user_email:
-           spreadsheet.share(user_email, perm_type='user', role='writer')
-           if verbose:
-               print(f"Shared spreadsheet with {user_email}")
-       time.sleep(5)
+        ws = wb.create_sheet(title=sanitize_sheet_name(parsha_name, used_names))
+        set_column_widths(ws, num_columns=6)
 
-       parsha_data = defaultdict(list)
-       for item in data['items']:
-           parsha_name = item['name']['en']
-           if not is_special_day(parsha_name):
-               parsha_data[parsha_name].append(item)
+        parsha_pages = page_numbers.get(parsha_name) if page_numbers else None
 
-       if test_mode and parsha_data:
-           first_parsha = next(iter(parsha_data))
-           parsha_data = {first_parsha: parsha_data[first_parsha]}
-           if verbose:
-               print(f"Test mode: Processing only parsha {first_parsha}")
+        next_row = write_header(ws, parsha_instance,
+                                scroll_name=scroll_name,
+                                template_data=template_data)
+        next_row = write_aliyot(ws, parsha_instance.get('fullkriyah', {}),
+                                parsha_instance, start_row=next_row,
+                                page_numbers=parsha_pages,
+                                scroll_name=scroll_name)
+        write_footer(ws, start_row=next_row + 1,
+                     page_numbers=parsha_pages,
+                     template_data=template_data)
 
-       worksheets = spreadsheet.worksheets()
-       
-       first_sheet = worksheets[0]
-       if first_sheet.title != "Minyan":
-           first_sheet.update_title("Minyan")
-           time.sleep(5)
-       first_sheet.clear()
-       time.sleep(5)
-       
-       if len(worksheets) > 1:
-           if verbose:
-               print("Removing old worksheets...")
-           for worksheet in tqdm(worksheets[1:], disable=not verbose):
-               try:
-                   spreadsheet.del_worksheet(worksheet)
-                   time.sleep(5)
-               except Exception as e:
-                   if verbose:
-                       print(f"Error deleting worksheet: {e}")
-                   continue
-       
-       write_minyan(first_sheet, data, verbose)
-       
-       if verbose:
-           print("Processing parshas...")
-       
-       for parsha_name, items in tqdm(parsha_data.items(), disable=not verbose):
-           if verbose:
-               print(f"\nProcessing {parsha_name}")
+    wb.save(output_path)
 
-           parsha_instance = next(
-               (item for item in items if 'fullkriyah' in item),
-               items[0]
-           )
+    print(f"\n{'=' * 60}")
+    print(f"WORKBOOK CREATED: {output_path}")
+    print(f"  Minyan + {len(parsha_data)} parsha sheet(s)")
+    print(f"{'=' * 60}")
+    return output_path
 
-           try:
-               worksheet = spreadsheet.add_worksheet(parsha_name, 1000, 26)
-           except gspread.exceptions.APIError as e:
-               if "already exists" in str(e):
-                   if verbose:
-                       print(f"Sheet {parsha_name} already exists, trying to delete it first")
-                   try:
-                       old_sheet = spreadsheet.worksheet(parsha_name)
-                       spreadsheet.del_worksheet(old_sheet)
-                       time.sleep(5)
-                       worksheet = spreadsheet.add_worksheet(parsha_name, 1000, 26)
-                   except Exception as inner_e:
-                       print(f"Error handling duplicate sheet: {inner_e}")
-                       continue
-               else:
-                   raise e
 
-           time.sleep(5)
+# ---------------------------------------------------------------------------
+# Default template generator
+# ---------------------------------------------------------------------------
 
-           parsha_pages = page_numbers.get(parsha_name) if page_numbers else None
-           
-           set_global_format(worksheet, verbose)
-           set_column_widths(worksheet, verbose)
-           write_header(worksheet, parsha_instance)
-           write_aliyot(worksheet, parsha_instance.get('fullkriyah', {}), parsha_instance, page_numbers=parsha_pages)
-           write_footer(worksheet, page_numbers=parsha_pages)
+def make_template(path):
+    """Create a starter template.xlsx (Header + Footer sheets) users can edit."""
+    wb = Workbook()
+    header = wb.active
+    header.title = 'Header'
 
-       worksheets = spreadsheet.worksheets()
-       if worksheets[0].title != "Minyan":
-           spreadsheet.reorder_worksheets([first_sheet] + [ws for ws in worksheets if ws.title != "Minyan"])
-           time.sleep(5)
+    # Static layout; dynamic cells (B1, D1, E1, D2, B3, C6, B13, C13, B14)
+    # are intentionally blank and get filled in per parsha.
+    header_rows = [
+        ["", "", "", "", "", ""],
+        ["Rabbi Amanda Russell", "", "", "", "", ""],
+        ["Service leaders", "", "", "", "", ""],
+        ["", "P'sukei D'zimrah", "", "", "", ""],
+        ["", "Shacharit", "", "", "", ""],
+        ["", "Musaf", "", "", "", ""],
+        ["", "Torah Service", "", "", "", ""],
+        ["", "Gabbai", "Sam (default)", "", "", ""],
+        ["", "Distribute honors", "Todd (default)", "", "", ""],
+        ["", "Read announcements", "Jerilyn (default)", "", "", ""],
+        ["Board hosts", "", "", "", "", ""],
+        ["", "", "", "", "", ""],
+        ["Torah(s) Scroll", "", "", "", "", ""],
+        ["", "", "Reader", "Aliyah", "Hebrew Name(s)", "Notes"],
+    ]
+    for r, row_vals in enumerate(header_rows, start=1):
+        size = 24 if r == 1 else 14 if r == 2 else DEFAULT_FONT_SIZE
+        for c, value in enumerate(row_vals, start=1):
+            write_cell(header, r, c, value, size=size)
+    set_column_widths(header, num_columns=6)
+    style_range(header, 'A3:A3', fill=solid_fill(GRAY))
+    style_range(header, 'A11:A11', fill=solid_fill(GRAY))
+    style_range(header, 'A13:B13', fill=solid_fill(ORANGE))
+    style_range(header, 'A14:F14', fill=solid_fill(GRAY))
 
-       if verbose:
-           print(f"\nSuccessfully wrote data to {sheet_name}")
-           print(f"Spreadsheet URL: {spreadsheet.url}")
+    footer = wb.create_sheet(title='Footer')
+    footer_rows = [
+        ["", "", "", "", "", ""],
+        ["", "Honors", "", "Etz Hayyim", "", ""],
+        ["P'ticha 1", "", "", "", "", ""],
+        ["P'ticha 2", "", "", "", "", ""],
+        ["Hagbah", "", "", "", "", ""],
+        ["G'lilah", "", "", "", "", ""],
+        ["Prayer for Country", "", "", "", "", ""],
+        ["Prayer for Israel", "", "", "", "", ""],
+        ["Prayer for Peace", "", "", "", "", ""],
+        ["Anim Zmerot", "", "", "", "", ""],
+        ["Adon Olam", "", "", "", "", ""],
+    ]
+    for r, row_vals in enumerate(footer_rows, start=1):
+        for c, value in enumerate(row_vals, start=1):
+            write_cell(footer, r, c, value)
+    set_column_widths(footer, num_columns=6)
+    gray = solid_fill(GRAY)
+    for col in (1, 2, 4):
+        footer.cell(row=2, column=col).fill = gray
 
-       return spreadsheet.url
+    wb.save(path)
+    print(f"Template written to {path}")
+    return path
 
-   except Exception as e:
-       print(f"Error writing to Google Sheets: {e}", file=sys.stderr)
-       raise
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+DEFAULT_TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'template.xlsx')
+
 
 def main():
-   parser = argparse.ArgumentParser(description='Fetch Torah reading information from HebCal API')
-   parser.add_argument('start_date', help='Start date in YYYY-MM-DD format')
-   parser.add_argument('end_date', help='End date in YYYY-MM-DD format')
-   parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
-   parser.add_argument('-s', '--sheet', help='Google Sheet name (if not provided, will only print JSON)')
-   parser.add_argument('-e', '--email', help='Email address to share the sheet with')
-   parser.add_argument('-t', '--test', action='store_true', help='Test mode - only process first parsha')
-   parser.add_argument('--pages', help='CSV file with page numbers')
-   
-   args = parser.parse_args()
-   
-   try:
-       datetime.strptime(args.start_date, '%Y-%m-%d')
-       datetime.strptime(args.end_date, '%Y-%m-%d')
-   except ValueError:
-       print("Error: Dates must be in YYYY-MM-DD format", file=sys.stderr)
-       sys.exit(1)
-   
-   # Get the leyning data
-   data = get_leyning(args.start_date, args.end_date, verbose=args.verbose)
-   
-   # Load page numbers if CSV provided
-   page_numbers = None
-   if args.pages:
-       page_numbers = load_page_numbers(args.pages)
-       
-   # Only print JSON output if verbose is on
-   if args.verbose:
-       print(json.dumps(data, indent=2, ensure_ascii=False))
+    parser = argparse.ArgumentParser(
+        description='Generate Torah-reading leyning sheets locally as .xlsx')
+    parser.add_argument('start_date', nargs='?',
+                        help='Start date in YYYY-MM-DD format')
+    parser.add_argument('end_date', nargs='?',
+                        help='End date in YYYY-MM-DD format')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Enable verbose output')
+    parser.add_argument('-s', '--sheet',
+                        help='Output .xlsx path (e.g. leyning_5786.xlsx)')
+    parser.add_argument('-t', '--test', action='store_true',
+                        help='Test mode - only process first parsha')
+    parser.add_argument('--pages', help='CSV file with page numbers')
+    parser.add_argument('--scroll', help='Name of scroll (default is Gunther)')
+    parser.add_argument('--template', default=DEFAULT_TEMPLATE,
+                        help='Path to a local .xlsx template '
+                             '(default: template.xlsx beside this script). '
+                             'Falls back to the built-in layout if missing.')
+    parser.add_argument('--json',
+                        help='Read HebCal leyning JSON from a local file '
+                             'instead of calling the API')
+    parser.add_argument('--make-template', metavar='PATH',
+                        help='Write a starter template .xlsx to PATH and exit')
 
-   # Write to Google Sheets if requested
-   if args.sheet:
-       if not args.email:
-           print("Error: --email is required when using --sheet", file=sys.stderr)
-           sys.exit(1)
-       sheet_url = write_to_sheets(data, args.sheet, args.email, 
-                                 test_mode=args.test, 
-                                 page_numbers=page_numbers,
-                                 verbose=args.verbose)
-       print(f"\nData written to Google Sheet: {sheet_url}")
+    args = parser.parse_args()
+
+    if args.make_template:
+        make_template(args.make_template)
+        return
+
+    if not args.start_date or not args.end_date:
+        parser.error("start_date and end_date are required "
+                     "(unless using --make-template)")
+
+    try:
+        datetime.strptime(args.start_date, '%Y-%m-%d')
+        datetime.strptime(args.end_date, '%Y-%m-%d')
+    except ValueError:
+        print("Error: Dates must be in YYYY-MM-DD format", file=sys.stderr)
+        sys.exit(1)
+
+    if args.json:
+        with open(args.json, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    else:
+        data = get_leyning(args.start_date, args.end_date, verbose=args.verbose)
+
+    page_numbers = None
+    if args.pages:
+        page_numbers = load_page_numbers(args.pages)
+
+    scroll_name = args.scroll if args.scroll else "Gunther"
+
+    template_data = None
+    if args.template and os.path.exists(args.template):
+        try:
+            template_data = load_template(args.template, verbose=args.verbose)
+            if args.verbose:
+                print(f"Template mode enabled: {args.template}")
+        except Exception as e:
+            print(f"Warning: Could not load template '{args.template}': {e}",
+                  file=sys.stderr)
+            print("Falling back to the built-in hardcoded layout.",
+                  file=sys.stderr)
+            template_data = None
+    elif args.verbose:
+        print(f"No template at '{args.template}'; using built-in layout.",
+              file=sys.stderr)
+
+    if args.sheet:
+        output_path = args.sheet
+        if not output_path.lower().endswith('.xlsx'):
+            output_path += '.xlsx'
+        build_workbook(data, output_path,
+                       test_mode=args.test,
+                       page_numbers=page_numbers,
+                       scroll_name=scroll_name,
+                       verbose=args.verbose,
+                       template_data=template_data)
+        print(f"\nData written to: {output_path}")
+    else:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+
 
 if __name__ == "__main__":
-   main()
-
+    main()
