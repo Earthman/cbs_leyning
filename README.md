@@ -41,21 +41,40 @@ A Python script that generates detailed Torah reading schedules using HebCal's L
 
 ## Usage
 
-Basic command:
+Generate one book at a time (recommended — no date lookup needed):
 ```bash
-python leyning.py START_DATE END_DATE -s OUTPUT.xlsx
+python leyning.py --book Leviticus --pages page_numbers_and_haftarot.csv
 ```
 
-Example:
+Or generate an explicit date range:
 ```bash
 python leyning.py 2025-04-01 2026-03-31 -s leyning_5786.xlsx --pages page_numbers_and_haftarot.csv
 ```
 
+### Generating by book
+
+`--book` (or `-b`) looks up the date range of the **next reading** of a
+Torah book from the HebCal API automatically, so you don't have to find the
+start and end dates yourself. Accepts English or transliterated names
+(`Genesis`/`Bereshit`, `Exodus`/`Shemot`, `Leviticus`/`Vayikra`,
+`Numbers`/`Bamidbar`, `Deuteronomy`/`Devarim`).
+
+"Next reading" means the next time the book starts fresh at its first
+parsha. If you are currently in the middle of that book, it resolves to next
+year's reading. The book's window naturally includes any interleaved
+festival readings (e.g. Purim and Pesach fall during Leviticus) — these get
+their own tabs, as they always have. When `--book` is used and `-s` is
+omitted, the output filename defaults to `<Book>.xlsx` (e.g.
+`Leviticus.xlsx`). `START_DATE`/`END_DATE` are not needed with `--book`.
+
 ### Arguments
 
-- `START_DATE`: Start date in YYYY-MM-DD format
-- `END_DATE`: End date in YYYY-MM-DD format
-- `-s, --sheet`: Output `.xlsx` path (the `.xlsx` extension is added if omitted)
+- `START_DATE`: Start date in YYYY-MM-DD format (omit when using `--book`)
+- `END_DATE`: End date in YYYY-MM-DD format (omit when using `--book`)
+- `-b, --book`: Generate the next reading of a Torah book; looks up the date
+  range automatically
+- `-s, --sheet`: Output `.xlsx` path (the `.xlsx` extension is added if
+  omitted; defaults to `<Book>.xlsx` with `--book`)
 - `-v, --verbose`: Enable verbose output
 - `-t, --test`: Test mode - process only first parsha
 - `--pages`: CSV file with page numbers

@@ -203,6 +203,141 @@ def get_leyning(start_date, end_date, verbose=False):
 
 
 # ---------------------------------------------------------------------------
+# Book lookup (--book): find the date range of the next reading of a book
+# ---------------------------------------------------------------------------
+
+CANONICAL_BOOKS = ['Genesis', 'Exodus', 'Leviticus', 'Numbers', 'Deuteronomy']
+
+BOOK_ALIASES = {
+    'genesis': 'Genesis', 'bereshit': 'Genesis', 'bereishit': 'Genesis',
+    "b'reshit": 'Genesis', 'breshit': 'Genesis',
+    'exodus': 'Exodus', 'shemot': 'Exodus', 'shmot': 'Exodus',
+    "sh'mot": 'Exodus',
+    'leviticus': 'Leviticus', 'vayikra': 'Leviticus', 'vayikrah': 'Leviticus',
+    'numbers': 'Numbers', 'bamidbar': 'Numbers', 'bemidbar': 'Numbers',
+    "b'midbar": 'Numbers', 'bmidbar': 'Numbers',
+    'deuteronomy': 'Deuteronomy', 'devarim': 'Deuteronomy',
+    "d'varim": 'Deuteronomy', 'dvarim': 'Deuteronomy',
+}
+
+
+def canonical_book(name):
+    """Map an English or transliterated book name to its canonical English
+    name (as used in HebCal aliyah 'k' fields). Returns None if unknown."""
+    if not name:
+        return None
+    return BOOK_ALIASES.get(name.strip().lower())
+
+
+def _shabbat_parsha_book(item):
+    """Return the Torah book of a regular weekly Shabbat parsha reading, or
+    None for weekday previews, festivals, and other special days.
+
+    A regular weekly parsha has a non-null `parshaNum`, no `weekday` flag,
+    and a full kriyah whose first aliyah names the book."""
+    if item.get('parshaNum') is None:
+        return None
+    if 'weekday' in item:
+        return None
+    fk = item.get('fullkriyah') or {}
+    a1 = fk.get('1')
+    if a1 is None and fk:
+        a1 = next(iter(fk.values()))
+    return a1.get('k') if a1 else None
+
+
+def resolve_book_range(items, target_book, today_str):
+    """Find the next reading of target_book on or after today_str.
+
+    Returns (start_date, end_date, parshas, closed) where parshas is a list
+    of (date, name) for the Shabbat readings in that book's run, and closed
+    is True if a different book follows the run in the supplied items (so the
+    run is known to be complete). Returns None if no upcoming reading is
+    found in the supplied items.
+
+    "Next reading" means the next time the book starts fresh: the first
+    Shabbat parsha of target_book (on/after today) whose preceding weekly
+    parsha belonged to a different book. The run then continues, skipping
+    any interleaved festival weeks, until a different book begins.
+
+    Items dated before today_str are still used for boundary detection (to
+    tell a fresh start from a mid-book week) but never become the start.
+    """
+    weekly = []
+    for it in items:
+        book = _shabbat_parsha_book(it)
+        if book:
+            weekly.append((it['date'], book, it['name']['en']))
+    weekly.sort(key=lambda x: x[0])
+
+    start_idx = None
+    for i, (date, book, _name) in enumerate(weekly):
+        if (book == target_book and date >= today_str
+                and (i == 0 or weekly[i - 1][1] != target_book)):
+            start_idx = i
+            break
+    if start_idx is None:
+        return None
+
+    end_idx = start_idx
+    while end_idx + 1 < len(weekly) and weekly[end_idx + 1][1] == target_book:
+        end_idx += 1
+
+    closed = (end_idx + 1 < len(weekly)
+              and weekly[end_idx + 1][1] != target_book)
+    parshas = [(d, n) for d, _b, n in weekly[start_idx:end_idx + 1]]
+    return weekly[start_idx][0], weekly[end_idx][0], parshas, closed
+
+
+def _next_day(date_str):
+    return (datetime.strptime(date_str, '%Y-%m-%d')
+            + timedelta(days=1)).strftime('%Y-%m-%d')
+
+
+def find_next_book_reading(book, today_str, verbose=False, max_chunks=6):
+    """Page through the HebCal API to find the next complete reading of book.
+
+    HebCal's leyning endpoint caps each response at ~6 months, so a single
+    wide request is not enough. Fetch ~175-day chunks (starting a few weeks
+    before today, so book boundaries are visible) and stop as soon as the
+    target book's run is bounded by the following book.
+
+    Returns (items, start_date, end_date, parshas, closed) or None.
+    """
+    cursor = (datetime.strptime(today_str, '%Y-%m-%d')
+              - timedelta(days=21)).strftime('%Y-%m-%d')
+    collected = {}
+    last_resolved = None
+
+    for _ in range(max_chunks):
+        chunk_end = (datetime.strptime(cursor, '%Y-%m-%d')
+                     + timedelta(days=175)).strftime('%Y-%m-%d')
+        d = get_leyning(cursor, chunk_end, verbose=verbose)
+        items = d.get('items', [])
+        if not items:
+            break
+        for it in items:
+            collected[(it['date'], it['name']['en'], 'weekday' in it)] = it
+
+        last_resolved = resolve_book_range(
+            list(collected.values()), book, today_str)
+        if last_resolved is not None and last_resolved[3]:  # closed
+            break
+
+        rng = d.get('range') or {}
+        covered_end = rng.get('end') or max(it['date'] for it in items)
+        nxt = _next_day(covered_end)
+        if nxt <= cursor:  # no forward progress; give up
+            break
+        cursor = nxt
+
+    if last_resolved is None:
+        return None
+    start_date, end_date, parshas, closed = last_resolved
+    return list(collected.values()), start_date, end_date, parshas, closed
+
+
+# ---------------------------------------------------------------------------
 # Local .xlsx template loading
 # ---------------------------------------------------------------------------
 
@@ -758,6 +893,10 @@ def main():
                         help='Start date in YYYY-MM-DD format')
     parser.add_argument('end_date', nargs='?',
                         help='End date in YYYY-MM-DD format')
+    parser.add_argument('-b', '--book',
+                        help='Generate the next reading of a Torah book '
+                             '(e.g. Leviticus or Vayikra). Looks up the date '
+                             'range automatically; no dates needed.')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Enable verbose output')
     parser.add_argument('-s', '--sheet',
@@ -782,22 +921,71 @@ def main():
         make_template(args.make_template)
         return
 
-    if not args.start_date or not args.end_date:
-        parser.error("start_date and end_date are required "
-                     "(unless using --make-template)")
+    book = None
+    if args.book:
+        book = canonical_book(args.book)
+        if not book:
+            parser.error(
+                f"unknown book '{args.book}'. Use one of: "
+                + ", ".join(CANONICAL_BOOKS)
+                + " (Hebrew names like Vayikra/Bamidbar also accepted).")
+    elif not args.start_date or not args.end_date:
+        parser.error("provide START_DATE and END_DATE, or --book BOOK "
+                     "(or --make-template)")
 
-    try:
-        datetime.strptime(args.start_date, '%Y-%m-%d')
-        datetime.strptime(args.end_date, '%Y-%m-%d')
-    except ValueError:
-        print("Error: Dates must be in YYYY-MM-DD format", file=sys.stderr)
-        sys.exit(1)
+    if book:
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        if args.json:
+            with open(args.json, 'r', encoding='utf-8') as f:
+                src = json.load(f)
+            resolved = resolve_book_range(src['items'], book, today_str)
+            if resolved is None:
+                print(f"Error: could not find an upcoming reading of {book} "
+                      f"in {args.json}.", file=sys.stderr)
+                sys.exit(1)
+            start_date, end_date, parshas, closed = resolved
+            items_pool = src['items']
+        else:
+            if args.verbose:
+                print(f"Looking up next {book} reading from {today_str}...",
+                      file=sys.stderr)
+            found = find_next_book_reading(book, today_str,
+                                           verbose=args.verbose)
+            if found is None:
+                print(f"Error: could not find an upcoming reading of {book}.",
+                      file=sys.stderr)
+                sys.exit(1)
+            items_pool, start_date, end_date, parshas, closed = found
 
-    if args.json:
-        with open(args.json, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        if not closed:
+            print(f"Warning: the reading range for {book} may be incomplete "
+                  f"(no following book found in the available data).",
+                  file=sys.stderr)
+
+        # Restrict to this book's window so the workbook (including the
+        # weekday Minyan readings) covers exactly this book.
+        data = {'items': [it for it in items_pool
+                          if start_date <= it['date'] <= end_date]}
+
+        print(f"{book}: {start_date} ({parshas[0][1]}) -> "
+              f"{end_date} ({parshas[-1][1]}), {len(parshas)} parshas")
+        if args.verbose:
+            for d, n in parshas:
+                print(f"  {d}  {n}", file=sys.stderr)
     else:
-        data = get_leyning(args.start_date, args.end_date, verbose=args.verbose)
+        try:
+            datetime.strptime(args.start_date, '%Y-%m-%d')
+            datetime.strptime(args.end_date, '%Y-%m-%d')
+        except ValueError:
+            print("Error: Dates must be in YYYY-MM-DD format", file=sys.stderr)
+            sys.exit(1)
+
+        if args.json:
+            with open(args.json, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        else:
+            data = get_leyning(args.start_date, args.end_date,
+                               verbose=args.verbose)
 
     page_numbers = None
     if args.pages:
@@ -821,8 +1009,11 @@ def main():
         print(f"No template at '{args.template}'; using built-in layout.",
               file=sys.stderr)
 
-    if args.sheet:
-        output_path = args.sheet
+    output_path = args.sheet
+    if not output_path and book:
+        output_path = f"{book}.xlsx"
+
+    if output_path:
         if not output_path.lower().endswith('.xlsx'):
             output_path += '.xlsx'
         build_workbook(data, output_path,
