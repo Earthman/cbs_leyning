@@ -289,6 +289,17 @@ def resolve_book_range(items, target_book, today_str):
     return weekly[start_idx][0], weekly[end_idx][0], parshas, closed
 
 
+def _simchat_torah_after(items, date_str):
+    """Date of the first Simchat Torah on/after date_str in items, or None.
+
+    Deuteronomy's last Shabbat parsha is Ha'azinu, but the book is finished
+    on Simchat Torah, so --book Deuteronomy extends its window to that day
+    (picking up Yom Kippur, Sukkot and Shmini Atzeret along the way)."""
+    dates = [it['date'] for it in items
+             if it['name']['en'] == 'Simchat Torah' and it['date'] >= date_str]
+    return min(dates) if dates else None
+
+
 def _next_day(date_str):
     return (datetime.strptime(date_str, '%Y-%m-%d')
             + timedelta(days=1)).strftime('%Y-%m-%d')
@@ -486,7 +497,8 @@ def write_header(ws, parsha_data, scroll_name="Gunther", template_data=None):
     previous_date = (full_date - timedelta(days=1)).strftime('%B %-d')
 
     hebrew_date_parts = parsha_data['hdate'].split()
-    hebrew_date = f"{hebrew_date_parts[1]} {hebrew_date_parts[0]}"
+    # hdate is "<day> <month...> <year>"; month may be two words (Adar I/II)
+    hebrew_date = f"{' '.join(hebrew_date_parts[1:-1])} {hebrew_date_parts[0]}"
 
     total_verses = 0
     parsha_verses = 0
@@ -785,8 +797,23 @@ def build_workbook(data, output_path, test_mode=False, page_numbers=None,
     parsha_data = defaultdict(list)
     for item in data['items']:
         parsha_name = item['name']['en']
-        if not is_special_day(parsha_name):
+        # Shabbat Chol HaMoed is a full Shabbat service, so it gets its own
+        # tab (and also stays on the Minyan tab like other Chol HaMoed days)
+        is_shabbat_chm = (get_reading_type(parsha_name) == 'chol_hamoed'
+                          and 'shabbat' in parsha_name.lower())
+        if not is_special_day(parsha_name) or is_shabbat_chm:
             parsha_data[parsha_name].append(item)
+
+    # Order tabs by the date of the service each one is for (the item with
+    # the full kriyah), not by first appearance -- weekday previews carry the
+    # coming parsha's name and would otherwise pull its tab ahead of any
+    # holiday that falls earlier in the week. sorted() is stable, so tabs on
+    # the same day (e.g. a fast day and its Mincha) keep HebCal's order.
+    def _tab_date(items):
+        return next((it for it in items if 'fullkriyah' in it),
+                    items[0])['date']
+    parsha_data = dict(sorted(parsha_data.items(),
+                              key=lambda kv: _tab_date(kv[1])))
 
     if test_mode and parsha_data:
         first_parsha = next(iter(parsha_data))
@@ -988,6 +1015,15 @@ def main():
                   f"(no following book found in the available data).",
                   file=sys.stderr)
 
+        last_parsha_date = end_date
+        if book == 'Deuteronomy':
+            simchat_torah = _simchat_torah_after(items_pool, end_date)
+            if simchat_torah:
+                end_date = simchat_torah
+            else:
+                print("Warning: Simchat Torah not found in the available "
+                      "data; ending at the last parsha.", file=sys.stderr)
+
         # Back the window up to the Monday before the first parsha so the
         # Minyan tab includes that week's weekday readings; restrict to this
         # book's window otherwise.
@@ -996,7 +1032,9 @@ def main():
                           if window_start <= it['date'] <= end_date]}
 
         print(f"{book}: {start_date} ({parshas[0][1]}) -> "
-              f"{end_date} ({parshas[-1][1]}), {len(parshas)} parshas")
+              f"{last_parsha_date} ({parshas[-1][1]}), {len(parshas)} parshas")
+        if end_date != last_parsha_date:
+            print(f"  (window extended to {end_date}, Simchat Torah)")
         print(f"  (window starts {window_start}, the Monday before "
               f"{start_date}, to include the weekday minyan readings)")
         if args.verbose:

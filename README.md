@@ -78,8 +78,12 @@ Leviticus: 2027-03-20 (Vayikra) -> 2027-05-29 (Bechukotai), 10 parshas
   (window starts 2027-03-15, the Monday before 2027-03-20, to include the weekday minyan readings)
 ```
 
-This only affects the `--book` path; an explicit `START_DATE`/`END_DATE`
-range is used exactly as given.
+For Deuteronomy, the window also runs past the last parsha (Ha'azinu)
+through **Simchat Torah**, so the High Holiday, Sukkot and Simchat Torah
+tabs are included.
+
+These adjustments only affect the `--book` path; an explicit
+`START_DATE`/`END_DATE` range is used exactly as given.
 
 ### Arguments
 
@@ -142,7 +146,8 @@ Bereishit,3,36,Isaiah 42:5-43:10
 
 The script creates an `.xlsx` workbook with:
 - A "Minyan" tab for weekday readings
-- Individual tabs for each parsha containing:
+- Individual tabs for each parsha (and holiday), always ordered by the date
+  of the service each tab is for, containing:
   - Service information
   - Aliyah assignments
   - Verse ranges
