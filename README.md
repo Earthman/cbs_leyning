@@ -51,6 +51,20 @@ Or generate an explicit date range:
 python leyning.py 2025-04-01 2026-03-31 -s leyning_5786.xlsx --pages page_numbers_and_haftarot.csv
 ```
 
+### Virtual Tikkun join code
+
+`--join-code CODE` adds `&join=CODE` to every Virtual Tikkun link on the
+sheets (each aliyah's Roman numeral, Maftir, and the header's "Virtual
+Tikkun" link). A member who follows one and creates an account, or signs
+in, joins the community in Virtual Tikkun, rather than landing in Kahal.
+The code is the community's join link code from Virtual Tikkun's Admin >
+Settings; Beth Sholom's is recorded in `vt_join_code.txt`. A mistyped code
+is refused before anything is generated.
+
+```bash
+python leyning.py --book Genesis --pages page_numbers_and_haftarot.csv --join-code "$(cat vt_join_code.txt)"
+```
+
 ### Generating by book
 
 `--book` (or `-b`) looks up the date range of the **next reading** of a

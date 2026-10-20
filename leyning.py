@@ -7,6 +7,7 @@ from collections import defaultdict
 from tenacity import retry, stop_after_attempt, wait_exponential
 import pandas as pd
 import os
+import re
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment
@@ -485,7 +486,22 @@ def copy_block(ws, values, styles, start_row, num_rows, num_cols=6):
 # Section writers
 # ---------------------------------------------------------------------------
 
-def write_header(ws, parsha_data, scroll_name="Gunther", template_data=None):
+def join_param(join_code):
+    """The '&join=<code>' a Virtual Tikkun link carries for a community's
+    join link, so a member who signs up from the sheet joins the community
+    (Virtual Tikkun's docs/community-join-link-plan.md). Empty without a code."""
+    return f"&join={join_code}" if join_code else ""
+
+
+def normalize_join_code(raw):
+    """A join code as Virtual Tikkun issues it: 12 characters of Crockford
+    base32 (no I, L, O, U). Upper-cased; None when it is not one."""
+    code = (raw or "").strip().upper().replace("-", "")
+    return code if re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{12}", code) else None
+
+
+def write_header(ws, parsha_data, scroll_name="Gunther", template_data=None,
+                 join_code=None):
     """
     Write the header section. Returns the next available row (1-based).
 
@@ -529,8 +545,8 @@ def write_header(ws, parsha_data, scroll_name="Gunther", template_data=None):
         """Virtual Tikkun link whose scroll= value references the scroll-name
         cell, so editing that cell updates the link."""
         return (f'=hyperlink("https://myvirtualtikkun.com/?shul=cbssf'
-                f'&view=both&scroll="&{scroll_cell}&"&parsha={parsha_en}", '
-                f'"Virtual Tikkun")')
+                f'&view=both&scroll="&{scroll_cell}&"&parsha={parsha_en}'
+                f'{join_param(join_code)}", "Virtual Tikkun")')
 
     musaf_formula = ('=if(ISNUMBER(SEARCH("Richman",$A$2)), '
                      '"RDR default", "RAR default")')
@@ -592,7 +608,7 @@ def write_header(ws, parsha_data, scroll_name="Gunther", template_data=None):
 
 
 def write_aliyot(ws, fullkriyah, parsha_data, start_row,
-                 page_numbers=None, scroll_cell="$B$13"):
+                 page_numbers=None, scroll_cell="$B$13", join_code=None):
     """Write the aliyot section starting at start_row. Returns the next row.
 
     scroll_cell is the absolute reference to the cell holding the scroll
@@ -632,7 +648,8 @@ def write_aliyot(ws, fullkriyah, parsha_data, start_row,
         verse_info = format_verse_range(aliyah)
         vt_link = (f'=hyperlink("https://myvirtualtikkun.com/?shul=cbssf'
                    f'&scroll="&{scroll_cell}&"&parsha={parsha_name}'
-                   f'&aliyah=A{aliyah_num}", "{display_num}")')
+                   f'&aliyah=A{aliyah_num}{join_param(join_code)}", '
+                   f'"{display_num}")')
         emit(vt_link, display_num, verse_info)
 
     if 'M' in fullkriyah:
@@ -640,7 +657,7 @@ def write_aliyot(ws, fullkriyah, parsha_data, start_row,
         verse_info = format_verse_range(maftir)
         vt_link = (f'=hyperlink("https://myvirtualtikkun.com/?shul=cbssf'
                    f'&scroll="&{scroll_cell}&"&parsha={parsha_name}'
-                   f'&aliyah=M", "Maf")')
+                   f'&aliyah=M{join_param(join_code)}", "Maf")')
         emit(vt_link, "Maf", verse_info)
 
     if parsha_data:
@@ -792,7 +809,8 @@ def write_minyan(ws, parsha_data):
 # ---------------------------------------------------------------------------
 
 def build_workbook(data, output_path, test_mode=False, page_numbers=None,
-                   scroll_name="Gunther", verbose=False, template_data=None):
+                   scroll_name="Gunther", verbose=False, template_data=None,
+                   join_code=None):
     """Build the leyning workbook locally and save it to output_path."""
     parsha_data = defaultdict(list)
     for item in data['items']:
@@ -846,13 +864,15 @@ def build_workbook(data, output_path, test_mode=False, page_numbers=None,
 
         next_row = write_header(ws, parsha_instance,
                                 scroll_name=scroll_name,
-                                template_data=template_data)
+                                template_data=template_data,
+                                join_code=join_code)
         scroll_row_1based = (template_data['scroll_row'] + 1
                              if template_data else 13)
         next_row = write_aliyot(ws, parsha_instance.get('fullkriyah', {}),
                                 parsha_instance, start_row=next_row,
                                 page_numbers=parsha_pages,
-                                scroll_cell=f"$B${scroll_row_1based}")
+                                scroll_cell=f"$B${scroll_row_1based}",
+                                join_code=join_code)
         write_footer(ws, start_row=next_row + 1,
                      page_numbers=parsha_pages,
                      template_data=template_data)
@@ -967,8 +987,21 @@ def main():
                              'instead of calling the API')
     parser.add_argument('--make-template', metavar='PATH',
                         help='Write a starter template .xlsx to PATH and exit')
+    parser.add_argument('--join-code', metavar='CODE',
+                        help="The community's Virtual Tikkun join code "
+                             "(e.g. 24A677PXECFW), added to every Virtual "
+                             "Tikkun link as &join=CODE so a member who signs "
+                             "up from the sheet joins the community")
 
     args = parser.parse_args()
+
+    join_code = None
+    if args.join_code:
+        join_code = normalize_join_code(args.join_code)
+        if not join_code:
+            parser.error(f"'{args.join_code}' is not a join code: expected 12 "
+                         "letters and digits, as Virtual Tikkun's Admin > "
+                         "Settings shows it.")
 
     if args.make_template:
         make_template(args.make_template)
@@ -1089,7 +1122,8 @@ def main():
                        page_numbers=page_numbers,
                        scroll_name=scroll_name,
                        verbose=args.verbose,
-                       template_data=template_data)
+                       template_data=template_data,
+                       join_code=join_code)
         print(f"\nData written to: {output_path}")
     else:
         print(json.dumps(data, indent=2, ensure_ascii=False))
